@@ -1,11 +1,12 @@
 {
     "domain": "herospeed_xvr",
     "name": "Herospeed XVR",
-    "documentation": "https://github.com/DominikWrobel/herospeed_xvr",
-    "dependencies": [],
-    "config_flow": true,
     "codeowners": ["@DominikWrobel"],
+    "config_flow": true,
+    "dependencies": [],
+    "documentation": "https://github.com/DominikWrobel/herospeed_xvr",
+    "iot_class": "local_push",
+    "issue_tracker": "https://github.com/DominikWrobel/herospeed_xvr/issues",
     "requirements": [],
-    "version": "0.1",
-    "iot_class": "local_push"
+    "version": "0.1"
 }
