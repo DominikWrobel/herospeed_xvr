@@ -1,0 +1,29 @@
+{
+    "config": {
+        "title": "Herospeed XVR",
+        "step": {
+            "user": {
+                "title": "Set up Herospeed XVR Integration",
+                "description": "Set up your Herospeed XVR to monitor motion detection events.",
+                "data": {
+                    "host": "XVR IP Address",
+                    "port": "SMTP Port (default: 25)",
+                    "num_sensors": "Number of Camera Channels",
+                    "motion_reset_delay": "Motion Reset Delay (seconds)",
+                    "smtp_username": "SMTP Username (e.g., test@test.com)",
+                    "smtp_password": "SMTP Password"
+                }
+            }
+        },
+        "error": {
+            "cannot_connect": "Failed to connect to XVR",
+            "invalid_host": "Invalid IP address",
+            "invalid_port": "Invalid port number",
+            "invalid_num_sensors": "Number of sensors must be greater than 0",
+            "invalid_auth": "Invalid authentication credentials"
+        },
+        "abort": {
+            "already_configured": "Device is already configured"
+        }
+    }
+}
