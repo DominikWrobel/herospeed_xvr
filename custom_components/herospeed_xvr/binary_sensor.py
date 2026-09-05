@@ -1,32 +1,37 @@
 """Binary sensor platform for Herospeed XVR."""
+
+from __future__ import annotations
+
 import asyncio
-import json
-import logging
 import base64
-from datetime import datetime, timedelta
-import email
+import logging
+from collections.abc import Callable
 from email.parser import BytesParser
 from email.policy import default
 
 from homeassistant.components.binary_sensor import (
-    BinarySensorEntity,
     BinarySensorDeviceClass,
+    BinarySensorEntity,
 )
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.helpers.event import async_call_later
 
 from .const import (
-    DOMAIN,
     CONF_HOST,
-    CONF_PORT,
-    CONF_NUM_SENSORS,
     CONF_MOTION_RESET_DELAY,
-    CONF_SMTP_USERNAME,
+    CONF_NUM_SENSORS,
+    CONF_PORT,
     CONF_SMTP_PASSWORD,
+    CONF_SMTP_USERNAME,
+    DOMAIN,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+SMTP_IDLE_TIMEOUT = 120
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -41,194 +46,352 @@ async def async_setup_entry(
     smtp_username = config_entry.data[CONF_SMTP_USERNAME]
     smtp_password = config_entry.data[CONF_SMTP_PASSWORD]
 
-    sensors = []
-    for channel in range(1, num_sensors + 1):
-        sensors.append(HeropspeedXVRMotionSensor(
-            hass,
-            host,
-            channel,
-            motion_reset_delay
-        ))
+    sensors = [
+        HeropspeedXVRMotionSensor(
+            hass=hass,
+            host=host,
+            channel=channel,
+            reset_delay=motion_reset_delay,
+        )
+        for channel in range(1, num_sensors + 1)
+    ]
 
     async_add_entities(sensors, True)
 
-    # Start SMTP server
-    smtp_server = XVRSMTPServer(hass, host, port, sensors, smtp_username, smtp_password)
+    # Stop a stale server if the platform is set up again unexpectedly.
+    entry_data = hass.data.setdefault(DOMAIN, {}).setdefault(
+        config_entry.entry_id, {"smtp_server": None}
+    )
+    previous_server = entry_data.get("smtp_server")
+    if previous_server is not None:
+        await previous_server.stop()
+
+    smtp_server = XVRSMTPServer(
+        hass=hass,
+        config_entry=config_entry,
+        host=host,
+        port=port,
+        sensors=sensors,
+        username=smtp_username,
+        password=smtp_password,
+    )
     await smtp_server.start()
+    entry_data["smtp_server"] = smtp_server
+
 
 class HeropspeedXVRMotionSensor(BinarySensorEntity):
-    """Representation of a Herospeed XVR Motion Sensor."""
+    """Representation of a Herospeed XVR motion sensor."""
 
-    def __init__(self, hass, host, channel, reset_delay):
+    _attr_device_class = BinarySensorDeviceClass.MOTION
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        host: str,
+        channel: int,
+        reset_delay: int | float,
+    ) -> None:
         """Initialize the sensor."""
         self._hass = hass
         self._host = host
         self._channel = channel
         self._reset_delay = reset_delay
+        self._cancel_reset_timer: Callable[[], None] | None = None
+
         self._attr_is_on = False
-        self._reset_timer = None
+        self._attr_name = f"XVR Channel {channel} Motion"
+        self._attr_unique_id = f"herospeed_xvr_{host}_channel_{channel}"
 
-    @property
-    def name(self):
-        """Return the name of the sensor."""
-        return f"XVR Channel {self._channel} Motion"
-
-    @property
-    def unique_id(self):
-        """Return a unique ID."""
-        return f"herospeed_xvr_{self._host}_channel_{self._channel}"
-
-    @property
-    def device_class(self):
-        """Return the class of this device."""
-        return BinarySensorDeviceClass.MOTION
-
-    async def async_set_motion(self, detected: bool = True):
+    async def async_set_motion(self, detected: bool = True) -> None:
         """Handle motion detection."""
         self._attr_is_on = detected
         self.async_write_ha_state()
 
-        if self._reset_timer:
-            self._reset_timer.cancel()
+        if self._cancel_reset_timer is not None:
+            self._cancel_reset_timer()
+            self._cancel_reset_timer = None
 
         if detected:
-            self._reset_timer = self._hass.loop.call_later(
+            self._cancel_reset_timer = async_call_later(
+                self._hass,
                 self._reset_delay,
-                lambda: asyncio.create_task(self.async_set_motion(False))
+                self._async_reset_motion,
             )
+
+    async def _async_reset_motion(self, _now=None) -> None:
+        """Reset motion state after the configured delay."""
+        self._cancel_reset_timer = None
+        await self.async_set_motion(False)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Cancel the pending reset timer when the entity is removed."""
+        if self._cancel_reset_timer is not None:
+            self._cancel_reset_timer()
+            self._cancel_reset_timer = None
+
 
 class XVRSMTPServer:
     """Simple SMTP server to receive XVR alerts."""
 
-    def __init__(self, hass, host, port, sensors, username, password):
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        config_entry: ConfigEntry,
+        host: str,
+        port: int,
+        sensors: list[HeropspeedXVRMotionSensor],
+        username: str,
+        password: str,
+    ) -> None:
         """Initialize the SMTP server."""
         self.hass = hass
+        self.config_entry = config_entry
         self.host = host
         self.port = port
         self.sensors = {sensor._channel: sensor for sensor in sensors}
         self.username = username
         self.password = password
-        self.server = None
-        self.authenticated = False
 
-    async def start(self):
+        self.server: asyncio.AbstractServer | None = None
+        self._connection_tasks: set[asyncio.Task[None]] = set()
+        self._writers: set[asyncio.StreamWriter] = set()
+        self._stopping = False
+
+    async def start(self) -> None:
         """Start the SMTP server."""
-        loop = asyncio.get_event_loop()
-        
-        def handle_connection(reader, writer):
-            asyncio.create_task(self.handle_smtp(reader, writer))
-            
+        if self.server is not None:
+            return
+
+        self._stopping = False
+
+        def handle_connection(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            if self._stopping:
+                writer.close()
+                return
+
+            task = self.config_entry.async_create_background_task(
+                self.hass,
+                self.handle_smtp(reader, writer),
+                name=f"{DOMAIN} SMTP connection",
+            )
+            self._connection_tasks.add(task)
+            task.add_done_callback(self._connection_tasks.discard)
+
         self.server = await asyncio.start_server(
             handle_connection,
-            host='0.0.0.0',  # Listen on all interfaces
-            port=self.port
+            host="0.0.0.0",
+            port=self.port,
         )
-        
-        _LOGGER.info(f"XVR SMTP server started on port {self.port}")
 
-    async def handle_smtp(self, reader, writer):
-        """Handle SMTP connection."""
+        _LOGGER.info("XVR SMTP server started on port %s", self.port)
+
+    async def stop(self) -> None:
+        """Stop the SMTP server and all active SMTP connections."""
+        if self._stopping:
+            return
+
+        self._stopping = True
+
+        server = self.server
+        self.server = None
+        if server is not None:
+            server.close()
+            await server.wait_closed()
+
+        # Close active transports first so pending reader.readline() calls wake up.
+        writers = list(self._writers)
+        for writer in writers:
+            if not writer.is_closing():
+                writer.close()
+
+        if writers:
+            await asyncio.gather(
+                *(self._wait_writer_closed(writer) for writer in writers),
+                return_exceptions=True,
+            )
+
+        # Explicitly cancel and await all connection tasks. This guarantees that
+        # no handle_smtp() coroutine remains pending when HA unloads the entry.
+        tasks = [task for task in self._connection_tasks if not task.done()]
+        for task in tasks:
+            task.cancel()
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        self._connection_tasks.clear()
+        self._writers.clear()
+
+        _LOGGER.info("XVR SMTP server stopped")
+
+    async def handle_smtp(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Handle one SMTP connection."""
+        authenticated = False
+        peername = writer.get_extra_info("peername")
+        self._writers.add(writer)
+
         try:
-            # Send greeting
-            writer.write(b'220 Welcome to Home Assistant XVR SMTP Server\r\n')
+            writer.write(b"220 Welcome to Home Assistant XVR SMTP Server\r\n")
             await writer.drain()
 
-            self.authenticated = False
-            while True:
-                data = await reader.readline()
+            while not self._stopping:
+                data = await self._readline(reader)
                 if not data:
                     break
 
-                line = data.decode().strip()
+                line = data.decode(errors="replace").strip()
                 upper_line = line.upper()
-                
-                if upper_line.startswith('HELO') or upper_line.startswith('EHLO'):
-                    writer.write(b'250-Hello\r\n')
-                    writer.write(b'250-AUTH LOGIN PLAIN\r\n')
-                    writer.write(b'250 HELP\r\n')
-                elif upper_line.startswith('AUTH LOGIN'):
-                    writer.write(b'334 VXNlcm5hbWU6\r\n')  # Base64 for "Username:"
-                    username_b64 = await reader.readline()
-                    username = base64.b64decode(username_b64.strip()).decode()
-                    
-                    writer.write(b'334 UGFzc3dvcmQ6\r\n')  # Base64 for "Password:"
-                    password_b64 = await reader.readline()
-                    password = base64.b64decode(password_b64.strip()).decode()
-                    
-                    if username == self.username and password == self.password:
-                        self.authenticated = True
-                        writer.write(b'235 Authentication successful\r\n')
-                    else:
-                        writer.write(b'535 Authentication failed\r\n')
-                elif upper_line.startswith('AUTH PLAIN'):
-                    if len(line.split(' ')) > 2:
-                        # Auth string is provided in the command
-                        auth_string = base64.b64decode(line.split(' ')[2]).decode()
-                        _, username, password = auth_string.split('\0')
-                    else:
-                        # Auth string is provided in the next line
-                        writer.write(b'334 \r\n')
-                        auth_data = await reader.readline()
-                        auth_string = base64.b64decode(auth_data.strip()).decode()
-                        _, username, password = auth_string.split('\0')
-                    
-                    if username == self.username and password == self.password:
-                        self.authenticated = True
-                        writer.write(b'235 Authentication successful\r\n')
-                    else:
-                        writer.write(b'535 Authentication failed\r\n')
-                elif not self.authenticated:
-                    writer.write(b'530 Authentication required\r\n')
-                elif upper_line.startswith('MAIL FROM:'):
-                    writer.write(b'250 Ok\r\n')
-                elif upper_line.startswith('RCPT TO:'):
-                    writer.write(b'250 Ok\r\n')
-                elif upper_line == 'DATA':
-                    writer.write(b'354 End data with <CR><LF>.<CR><LF>\r\n')
-                    email_data = []
-                    while True:
-                        line = await reader.readline()
-                        if line.strip() == b'.':
-                            break
-                        email_data.append(line)
-                    
-                    # Process the email
-                    await self.process_email(b''.join(email_data))
-                    writer.write(b'250 Ok: queued\r\n')
-                elif upper_line == 'QUIT':
-                    writer.write(b'221 Bye\r\n')
+
+                if upper_line.startswith("HELO") or upper_line.startswith("EHLO"):
+                    writer.write(b"250-Hello\r\n")
+                    writer.write(b"250-AUTH LOGIN PLAIN\r\n")
+                    writer.write(b"250 HELP\r\n")
+
+                elif upper_line == "QUIT":
+                    writer.write(b"221 Bye\r\n")
+                    await writer.drain()
                     break
+
+                elif upper_line.startswith("AUTH LOGIN"):
+                    writer.write(b"334 VXNlcm5hbWU6\r\n")
+                    await writer.drain()
+                    username_b64 = await self._readline(reader)
+                    if not username_b64:
+                        break
+                    username = base64.b64decode(username_b64.strip()).decode()
+
+                    writer.write(b"334 UGFzc3dvcmQ6\r\n")
+                    await writer.drain()
+                    password_b64 = await self._readline(reader)
+                    if not password_b64:
+                        break
+                    password = base64.b64decode(password_b64.strip()).decode()
+
+                    if username == self.username and password == self.password:
+                        authenticated = True
+                        writer.write(b"235 Authentication successful\r\n")
+                    else:
+                        authenticated = False
+                        writer.write(b"535 Authentication failed\r\n")
+
+                elif upper_line.startswith("AUTH PLAIN"):
+                    parts = line.split(" ", 2)
+                    if len(parts) > 2 and parts[2]:
+                        auth_data = parts[2].encode()
+                    else:
+                        writer.write(b"334 \r\n")
+                        await writer.drain()
+                        auth_data = await self._readline(reader)
+                        if not auth_data:
+                            break
+
+                    auth_string = base64.b64decode(auth_data.strip()).decode()
+                    _, username, password = auth_string.split("\0", 2)
+
+                    if username == self.username and password == self.password:
+                        authenticated = True
+                        writer.write(b"235 Authentication successful\r\n")
+                    else:
+                        authenticated = False
+                        writer.write(b"535 Authentication failed\r\n")
+
+                elif not authenticated:
+                    writer.write(b"530 Authentication required\r\n")
+
+                elif upper_line.startswith("MAIL FROM:"):
+                    writer.write(b"250 Ok\r\n")
+
+                elif upper_line.startswith("RCPT TO:"):
+                    writer.write(b"250 Ok\r\n")
+
+                elif upper_line == "DATA":
+                    writer.write(b"354 End data with <CR><LF>.<CR><LF>\r\n")
+                    await writer.drain()
+
+                    email_data: list[bytes] = []
+                    while not self._stopping:
+                        data_line = await self._readline(reader)
+                        if not data_line:
+                            break
+                        if data_line.strip() == b".":
+                            break
+                        email_data.append(data_line)
+
+                    if self._stopping:
+                        break
+
+                    if not data_line:
+                        break
+
+                    await self.process_email(b"".join(email_data))
+                    writer.write(b"250 Ok: queued\r\n")
+
                 else:
-                    writer.write(b'250 Ok\r\n')
+                    writer.write(b"250 Ok\r\n")
 
                 await writer.drain()
 
-        except Exception as e:
-            _LOGGER.error(f"SMTP Error: {str(e)}")
+        except TimeoutError:
+            _LOGGER.debug(
+                "SMTP connection from %s closed after %s seconds of inactivity",
+                peername,
+                SMTP_IDLE_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except (ConnectionError, OSError):
+            _LOGGER.debug("SMTP connection from %s was closed", peername)
+        except Exception:
+            _LOGGER.exception("SMTP error for connection from %s", peername)
         finally:
-            writer.close()
-            await writer.wait_closed()
+            self._writers.discard(writer)
+            if not writer.is_closing():
+                writer.close()
+            await self._wait_writer_closed(writer)
 
-    async def process_email(self, email_data):
+    async def _readline(self, reader: asyncio.StreamReader) -> bytes:
+        """Read one SMTP line with an inactivity timeout."""
+        return await asyncio.wait_for(reader.readline(), timeout=SMTP_IDLE_TIMEOUT)
+
+    @staticmethod
+    async def _wait_writer_closed(writer: asyncio.StreamWriter) -> None:
+        """Wait for a stream writer to close without leaking shutdown errors."""
+        try:
+            await writer.wait_closed()
+        except (ConnectionError, OSError, asyncio.CancelledError):
+            pass
+
+    async def process_email(self, email_data: bytes) -> None:
         """Process received email data."""
         try:
-            parser = BytesParser(policy=default)
-            msg = parser.parsebytes(email_data)
-            
-            # Parse subject for motion detection
-            subject = msg['subject']
+            msg = BytesParser(policy=default).parsebytes(email_data)
+
+            subject = msg["subject"]
             if not subject:
                 return
-            
-            if 'Motion' in subject and 'Channel' in subject:
-                # Extract channel number
+
+            if "Motion" in subject and "Channel" in subject:
                 try:
-                    channel = int(subject.split('Channel')[-1].strip())
-                    if channel in self.sensors:
-                        await self.sensors[channel].async_set_motion(True)
-                        _LOGGER.info(f"Motion detected on channel {channel}")
+                    channel = int(subject.split("Channel")[-1].strip())
                 except ValueError:
-                    _LOGGER.error(f"Could not parse channel number from subject: {subject}")
-            
-        except Exception as e:
-            _LOGGER.error(f"Error processing email: {str(e)}")
+                    _LOGGER.error(
+                        "Could not parse channel number from subject: %s", subject
+                    )
+                    return
+
+                sensor = self.sensors.get(channel)
+                if sensor is not None:
+                    await sensor.async_set_motion(True)
+                    _LOGGER.info("Motion detected on channel %s", channel)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.exception("Error processing XVR email")
